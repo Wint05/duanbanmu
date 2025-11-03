@@ -489,7 +489,6 @@
   border-color: #febc49;
   color: #febc49;
 }
-
 .pagination-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
