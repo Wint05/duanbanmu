@@ -46,6 +46,7 @@ export class CounterSalesComponent implements OnInit {
   cartSubtotal: number = 0;
   cartDiscount: number = 0;
   cartTax: number = 10;
+  cartTaxAmount: number = 0;
   couponDiscount: number = 0;
   // Cash received from customer at checkout
   cashReceived: number | null = null;
@@ -73,6 +74,7 @@ export class CounterSalesComponent implements OnInit {
   invoiceSearch: string = '';
   pendingInvoices: HoaDonCho[] = [];
   currentHoaDonChoId: number | null = null; // Current pending invoice ID
+  activePendingInvoiceId: number | null = null;
   isInvoiceCreated: boolean = false; // Track if invoice has been created
   customerSearch: string = '';
   customerResults: { id: number; name: string; phone: string }[] = [];
@@ -86,6 +88,7 @@ export class CounterSalesComponent implements OnInit {
   // Delivery input (when customer has no saved address)
   shippingAddress: string = '';
   shippingNote: string = '';
+  shippingFee: number = 0;
 
   // Coupon state
   couponCode: string = '';
@@ -114,6 +117,7 @@ export class CounterSalesComponent implements OnInit {
   showBestTab: boolean = true;
   showVoucherModal: boolean = false; // Modal để xem tất cả phiếu giảm giá
   voucherModalSearchTerm: string = ''; // Tìm kiếm trong modal
+  showConfirmPaymentModal: boolean = false;
 
   // Product filter + pagination for POS list
   // Options cho bộ lọc – được build động từ dữ liệu sản phẩm chi tiết
@@ -150,6 +154,15 @@ export class CounterSalesComponent implements OnInit {
   showViewModal: boolean = false;
   showDeleteModal: boolean = false;
   showCartModal: boolean = false;
+  confirmDeleteModal: {
+    visible: boolean;
+    message: string;
+    onConfirm: (() => void) | null;
+  } = {
+    visible: false,
+    message: '',
+    onConfirm: null,
+  };
 
   // Form data
   newSale: Partial<CounterSale> = {
@@ -197,7 +210,9 @@ export class CounterSalesComponent implements OnInit {
   availableProducts: any[] = [];
   productIdToImageUrl: { [productId: number]: string } = {};
   chiTietSanPhamIdToProductId: { [chiTietSanPhamId: number]: number } = {};
+  chiTietImageUrl: { [chiTietSanPhamId: number]: string } = {};
   productOrderMap: Map<number, number> = new Map(); // Map to preserve product order: productId -> originalIndex
+  productOriginalStock: Record<number, number> = {};
 
   private parsePrice(value: any): number {
     if (typeof value === 'number' && isFinite(value)) return value;
@@ -210,6 +225,9 @@ export class CounterSalesComponent implements OnInit {
 
   // Helper method to get image URL from chiTietSanPhamId
   private getImageUrlFromChiTietSanPhamId(chiTietSanPhamId: number): string | undefined {
+    if (this.chiTietImageUrl[chiTietSanPhamId]) {
+      return this.chiTietImageUrl[chiTietSanPhamId];
+    }
     // First, try to get productId from mapping
     const productId = this.chiTietSanPhamIdToProductId[chiTietSanPhamId];
     if (productId && this.productIdToImageUrl[productId]) {
@@ -291,6 +309,29 @@ export class CounterSalesComponent implements OnInit {
     this.refreshVoucherSuggestions();
     this.loadPendingInvoices();
     this.loadProvinces();
+  }
+
+  isPayButtonDisabled(): boolean {
+    if (this.cart.length === 0) return true;
+    if (this.checkoutPaymentMethod === 'cash') {
+      const received = this.cashReceived;
+      if (received === null || received === undefined) return true;
+      return Number(received) < this.cartTotal;
+    }
+    return false;
+  }
+
+  confirmPayment(): void {
+    this.showConfirmPaymentModal = true;
+  }
+
+  cancelPaymentConfirmation(): void {
+    this.showConfirmPaymentModal = false;
+  }
+
+  proceedPaymentConfirmation(): void {
+    this.showConfirmPaymentModal = false;
+    this.processSale();
   }
 
   loadSampleData(): void {
@@ -380,16 +421,22 @@ export class CounterSalesComponent implements OnInit {
       next: (rows: ChiTietSanPhamResponse[] | any) => {
         // Xử lý response structure khác nhau
         const raw = Array.isArray(rows) ? rows : rows?.data || rows?.content || [];
+        this.chiTietSanPhamIdToProductId = {};
+        this.chiTietImageUrl = {};
 
         const variants = (raw || []).map((r: any) => {
           // Lấy trongLuongTen từ DB - không dùng trongLuongId
           const trongLuongTen = r.trongLuongTen || r.trong_luong_ten || '';
           const chiTietId = r.id;
           const productId = r.sanPhamId || r.san_pham_id;
+          const variantImage = r.anhSanPham || r.anh_san_pham || null;
 
           // Map chiTietSanPhamId to productId
           if (chiTietId && productId) {
             this.chiTietSanPhamIdToProductId[chiTietId] = productId;
+          }
+          if (chiTietId && variantImage) {
+            this.chiTietImageUrl[chiTietId] = variantImage;
           }
 
           return {
@@ -407,7 +454,7 @@ export class CounterSalesComponent implements OnInit {
             ram: r.kichThuocTen || r.kich_thuoc_ten || '',
             storage: trongLuongTen, // Dùng trongLuongTen từ DB
             productId: productId,
-            imageUrl: undefined as string | undefined,
+            imageUrl: variantImage || undefined,
           };
         });
 
@@ -429,6 +476,12 @@ export class CounterSalesComponent implements OnInit {
         }
 
         this.availableProducts = variants;
+        this.productOriginalStock = {};
+        this.availableProducts.forEach((product: any) => {
+          if (product?.id !== undefined && product?.id !== null) {
+            this.productOriginalStock[product.id] = Number(product.stock ?? 0);
+          }
+        });
         // Build options động từ dữ liệu
         const colors = new Set<string>();
         const sizes = new Set<string>();
@@ -456,11 +509,19 @@ export class CounterSalesComponent implements OnInit {
               // Gán vào các biến thể cùng productId
               this.availableProducts
                 .filter((v) => v.productId === pid)
-                .forEach((v) => (v.imageUrl = p.anhSanPham as string));
+                .forEach((v) => {
+                  if (!v.imageUrl) {
+                    v.imageUrl = p.anhSanPham as string;
+                  }
+                });
             }
           });
         });
-        this.filterProducts();
+        // Hiển thị ngay danh sách sản phẩm khi mở màn hình
+        this.filteredProducts = [...this.availableProducts];
+        this.productPage = 1;
+        this.updateProductPagination();
+        this.applyCartStockReservations();
       },
       error: (err) => {
         this.availableProducts = [];
@@ -487,12 +548,14 @@ export class CounterSalesComponent implements OnInit {
       const color = (p.color || p.colorName || '').toString().trim();
       const size = (p.ram || '').toString().trim();
       const weight = (p.storage || '').toString().trim();
+      const stock = Number(p.stock ?? 0);
 
       const matchTerm = !term || name.includes(term) || code.includes(term);
       const matchColor = selColor === 'all' || color === selColor;
       const matchSize = selSize === 'all' || size === selSize;
       const matchWeight = selWeight === 'all' || weight === selWeight;
-      return matchTerm && matchColor && matchSize && matchWeight;
+      const hasStock = stock > 0;
+      return matchTerm && matchColor && matchSize && matchWeight && hasStock;
     });
     this.productPage = 1;
     this.updateProductPagination();
@@ -522,8 +585,8 @@ export class CounterSalesComponent implements OnInit {
 
   // POS helpers
   createNewInvoice(): void {
-    // Kiểm tra số lượng hóa đơn chờ hiện tại (tối đa 5)
-    const MAX_PENDING_INVOICES = 5;
+    // Kiểm tra số lượng hóa đơn chờ hiện tại (tối đa 10)
+    const MAX_PENDING_INVOICES = 10;
     if (this.pendingInvoices.length >= MAX_PENDING_INVOICES) {
       this.showToast(
         `Bạn chỉ có thể tạo tối đa ${MAX_PENDING_INVOICES} hóa đơn chờ. Vui lòng xóa hoặc thanh toán hóa đơn chờ hiện tại trước khi tạo mới.`,
@@ -548,6 +611,7 @@ export class CounterSalesComponent implements OnInit {
     this.hoaDonChoService.createHoaDonCho(hoaDonChoData).subscribe({
       next: (created: HoaDonCho) => {
         this.currentHoaDonChoId = created.id || null;
+        this.activePendingInvoiceId = created.id || null;
 
         // Thêm hóa đơn mới vào danh sách ngay lập tức để hiển thị ngay
         // Đảm bảo có danhSachGioHang rỗng nếu chưa có
@@ -613,6 +677,7 @@ export class CounterSalesComponent implements OnInit {
     this.hoaDonChoService.getHoaDonChoById(inv.id).subscribe({
       next: (hoaDonCho: HoaDonCho) => {
         this.currentHoaDonChoId = hoaDonCho.id || null;
+        this.activePendingInvoiceId = hoaDonCho.id || null;
         // Convert GioHangChoItem[] to CartItem[]
         this.cart = (hoaDonCho.danhSachGioHang || []).map((item: GioHangChoItem) => {
           const imageUrl = this.getImageUrlFromChiTietSanPhamId(item.chiTietSanPhamId);
@@ -663,12 +728,13 @@ export class CounterSalesComponent implements OnInit {
       return;
     }
 
-    if (confirm('Bạn có chắc chắn muốn xóa hóa đơn chờ này?')) {
-      this.hoaDonChoService.deleteHoaDonCho(inv.id).subscribe({
+    this.openConfirmDeleteModal('Bạn có chắc chắn muốn xóa hóa đơn chờ này?', () => {
+      this.hoaDonChoService.deleteHoaDonCho(inv.id!).subscribe({
         next: () => {
           this.loadPendingInvoices();
           if (this.currentHoaDonChoId === inv.id) {
             this.currentHoaDonChoId = null;
+            this.activePendingInvoiceId = null;
             this.cart = [];
             this.calculateCartTotal();
             this.isInvoiceCreated = false;
@@ -682,7 +748,27 @@ export class CounterSalesComponent implements OnInit {
           );
         },
       });
+    });
+  }
+
+  openConfirmDeleteModal(message: string, onConfirm: () => void): void {
+    this.confirmDeleteModal = {
+      visible: true,
+      message,
+      onConfirm,
+    };
+  }
+
+  closeConfirmDeleteModal(): void {
+    this.confirmDeleteModal.visible = false;
+    this.confirmDeleteModal.onConfirm = null;
+  }
+
+  confirmDeleteAction(): void {
+    if (this.confirmDeleteModal.onConfirm) {
+      this.confirmDeleteModal.onConfirm();
     }
+    this.closeConfirmDeleteModal();
   }
 
   scanQr(): void {
@@ -814,7 +900,7 @@ export class CounterSalesComponent implements OnInit {
               this.newSale.customerId = id;
               this.customerSearch = `${name} - ${phoneDigits}`;
               this.customerResults = [];
-              this.showToast('Thêm khách hàng thành công', 'success');
+              this.showToast('Thêm mới khách hàng thành công', 'success', 3500);
               this.customerCreating = false;
               this.refreshVoucherSuggestions();
             },
@@ -836,11 +922,23 @@ export class CounterSalesComponent implements OnInit {
     });
   }
 
-  private showToast(message: string, type: 'success' | 'warning' | 'error' = 'success') {
+  private toastTimeoutRef: any;
+
+  private showToast(
+    message: string,
+    type: 'success' | 'warning' | 'error' = 'success',
+    duration: number = 2500
+  ) {
     this.toastMessage = message;
     this.toastType = type;
     this.toastVisible = true;
-    setTimeout(() => (this.toastVisible = false), 2500);
+    if (this.toastTimeoutRef) {
+      clearTimeout(this.toastTimeoutRef);
+    }
+    this.toastTimeoutRef = setTimeout(() => {
+      this.toastVisible = false;
+      this.toastTimeoutRef = null;
+    }, Math.max(1000, duration));
   }
 
   // Coupon handlers
@@ -1336,8 +1434,51 @@ export class CounterSalesComponent implements OnInit {
       this.couponDiscount = Math.min(this.couponDiscount, base);
     }
     const afterDiscount = Math.max(0, this.cartSubtotal - this.cartDiscount - this.couponDiscount);
-    this.cartTotal = afterDiscount + afterDiscount * (this.cartTax / 100);
+    this.cartTaxAmount = afterDiscount * (this.cartTax / 100);
+    const normalizedShipping = this.isDelivery ? Math.max(0, Number(this.shippingFee) || 0) : 0;
+    if (this.isDelivery) {
+      this.shippingFee = normalizedShipping;
+    }
+    const shippingAmount = this.isDelivery ? normalizedShipping : 0;
+    this.cartTotal = afterDiscount + this.cartTaxAmount + shippingAmount;
     this.refreshVoucherSuggestions();
+    this.applyCartStockReservations();
+  }
+
+  onShippingFeeChange(value: number | string): void {
+    const parsed = Number(value);
+    this.shippingFee = !isNaN(parsed) ? Math.max(0, parsed) : 0;
+    this.calculateCartTotal();
+  }
+
+  private applyCartStockReservations(): void {
+    if (!Array.isArray(this.availableProducts) || this.availableProducts.length === 0) {
+      return;
+    }
+
+    const reservedMap = new Map<number, number>();
+    this.cart.forEach((item) => {
+      const current = reservedMap.get(item.productId) ?? 0;
+      reservedMap.set(item.productId, current + item.quantity);
+    });
+
+    this.availableProducts.forEach((product: any) => {
+      if (!product || product.id === undefined || product.id === null) {
+        return;
+      }
+      const original = this.productOriginalStock[product.id];
+      const baseStock =
+        original !== undefined && original !== null ? original : Number(product.stock ?? 0);
+      const reserved = reservedMap.get(product.id) ?? 0;
+      product.stock = Math.max(0, baseStock - reserved);
+    });
+
+    if (Array.isArray(this.filteredProducts)) {
+      this.filteredProducts = this.filteredProducts
+        .map((p) => ({ ...p }))
+        .filter((p) => Number(p.stock ?? 0) > 0);
+      this.updateProductPagination();
+    }
   }
 
   private refreshVoucherSuggestions(): void {
@@ -1382,6 +1523,15 @@ export class CounterSalesComponent implements OnInit {
     this.allVouchers = usable; // flat, sorted desc
     // Chỉ hiển thị một số phiếu giảm giá đầu tiên (giới hạn để view không bị dài)
     this.displayedVouchers = usable.slice(0, this.maxDisplayedVouchers);
+
+    const topVoucher = this.bestVoucher;
+    if (topVoucher) {
+      if (!this.appliedCoupon || this.appliedCoupon.code !== topVoucher.code) {
+        this.applyCouponFromSuggestion(topVoucher);
+      }
+    } else if (this.appliedCoupon) {
+      this.removeCoupon();
+    }
   }
 
   private computeVoucherDiscount(v: any, base: number): number {
@@ -1447,7 +1597,7 @@ export class CounterSalesComponent implements OnInit {
       discount: this.cartDiscount,
       discountAmount: this.cartDiscount,
       tax: this.cartTax,
-      taxAmount: (this.cartSubtotal - this.cartDiscount) * (this.cartTax / 100),
+      taxAmount: this.cartTaxAmount,
       totalAmount: this.cartTotal,
       paymentMethod: this.newSale.paymentMethod!,
       paymentStatus: this.newSale.paymentStatus!,
@@ -1470,6 +1620,7 @@ export class CounterSalesComponent implements OnInit {
       tongTien: Math.round(this.cartTotal),
       thanhTien: Math.round(this.cartTotal),
       tienGiamGia: Math.round(this.cartDiscount + this.couponDiscount),
+      phiGiaoHang: Math.round(this.isDelivery ? this.shippingFee : 0),
       phuongThucThanhToan: this.newSale.paymentMethod,
       trangThai: this.isDelivery ? 'DA_XAC_NHAN' : 'DA_GIAO_HANG',
       nhanVienId: this.newSale.staffId,
@@ -1510,6 +1661,7 @@ export class CounterSalesComponent implements OnInit {
         soDienThoaiNguoiNhan: this.newSale.customerPhone,
         // Note
         ghiChuGiaoHang: this.shippingNote,
+        phiGiaoHang: Math.round(this.shippingFee),
       };
     }
 
@@ -1735,7 +1887,12 @@ export class CounterSalesComponent implements OnInit {
   onDeliveryToggleChange(): void {
     if (this.isDelivery) {
       this.tryLoadCustomerDefaultAddress();
+      this.showToast('Đã bật chế độ bàn giao hàng. Vui lòng chọn địa chỉ giao.', 'success');
+    } else {
+      this.shippingFee = 0;
+      this.showToast('Đã tắt chế độ bàn giao hàng.', 'success');
     }
+    this.calculateCartTotal();
   }
 
   private tryLoadCustomerDefaultAddress(): void {
